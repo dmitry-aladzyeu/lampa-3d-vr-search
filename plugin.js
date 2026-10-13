@@ -1,4 +1,4 @@
-/* Lampa 3D / VR v0.2.0 — local, unpublished catalog candidate.
+/* Lampa 3D / VR v0.2.1 — safe Parser diagnostics.
  * Native Lampa API: yumata/lampa-source 7cb2ce0ce320070785ca0be4f43a14f638c1d7d8.
  * One self-contained ES5 file. No keys, settings writes or custom player links. */
 (function () {
@@ -260,7 +260,58 @@ var Adapter = (function (Core) {
     return {category: category, cardData: cardData, openRelease: openRelease};
 
 }(Core));
-var Loader = (function (Core) {
+var SafeErrors = (function () {
+
+    'use strict';
+    function translated(L, key, fallback) {
+        try { var text = L.Lang && L.Lang.translate(key); return typeof text === 'string' && text !== key ? text : fallback; }
+        catch (e) { return fallback; }
+    }
+    function scalar(object, key) {
+        try { return object && (typeof object[key] === 'string' || typeof object[key] === 'number') ? object[key] : ''; }
+        catch (e) { return ''; }
+    }
+    function describe(L, error, context, exception) {
+        var result = {kind: 'unknown', httpStatus: null, backend: null, jsName: null};
+        var text = typeof error === 'string' ? error.trim() : '';
+        var name = scalar(error, 'name');
+        var tag = typeof exception === 'string' ? exception : scalar(error, 'exception') || scalar(error, 'statusText') || scalar(error, 'type');
+        var jsNames = ['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'Error'];
+        if (context === 'js' || jsNames.indexOf(name) >= 0) {
+            result.kind = 'js'; result.jsName = jsNames.indexOf(name) >= 0 ? name : 'Error';
+        } else if (context === 'timeout' || name === 'TimeoutError' || tag === 'timeout' || text === 'timeout' || text === translated(L, 'network_timeout', 'Время ожидания истекло')) result.kind = 'timeout';
+        else if (name === 'AbortError' || tag === 'abort' || text === 'abort' || text === translated(L, 'network_abort', 'Запрос отменён')) result.kind = 'abort';
+        else {
+            // `decode_code` may be a fallback or a code inside responseJSON. It
+            // is deliberately NOT accepted as evidence of an HTTP status.
+            var status = scalar(error, 'status') || scalar(error, 'httpStatus') || scalar(error, 'statusCode');
+            if (/^[1-5][0-9]{2}$/.test(String(status))) { result.kind = 'http'; result.httpStatus = Number(status); }
+            else {
+                var setLink = translated(L, 'torrent_parser_set_link', 'Укажите ссылку для парсинга');
+                var backends = ['Jackett', 'Prowlarr', 'TorrServer'];
+                backends.forEach(function (backend) { if (text === setLink + ': ' + backend) { result.kind = 'not_configured'; result.backend = backend; } });
+                var noResponse = translated(L, 'torrent_parser_no_responce', 'Парсер не отвечает на запрос');
+                var requestError = translated(L, 'torrent_parser_request_error', 'Ошибка в запросе');
+                if (result.kind === 'unknown' && (text === noResponse || text.indexOf(noResponse + ' (') === 0)) result.kind = 'no_response';
+                if (result.kind === 'unknown' && (text === requestError || text.indexOf(requestError + ' (') === 0)) result.kind = 'bad_response';
+            }
+        }
+        var detail;
+        if (result.kind === 'http') detail = 'Error callback передал HTTP ' + result.httpStatus + '.';
+        else if (result.kind === 'not_configured') detail = 'Lampa сообщает: не задана ссылка источника ' + result.backend + '.';
+        else if (result.kind === 'no_response') detail = 'Lampa сообщает: парсер не отвечает. HTTP-статус не передан; точная сетевая причина неизвестна.';
+        else if (result.kind === 'bad_response') detail = 'Lampa сообщает об ошибке запроса или ответа. HTTP-статус не передан; сырой ответ скрыт.';
+        else if (result.kind === 'timeout') detail = 'Истекло время ожидания' + (context === 'timeout' ? ' плагина (60 секунд)' : '') + '. HTTP-статус не установлен.';
+        else if (result.kind === 'abort') detail = 'Запрос отменён (abort). HTTP-статус не установлен.';
+        else if (result.kind === 'js') detail = 'Ошибка JavaScript: ' + result.jsName + '. Текст исключения скрыт; HTTP-статус не установлен.';
+        else detail = 'Причина неизвестна: Parser не передал безопасно распознаваемые сведения. HTTP-статус не установлен.';
+        result.message = 'Parser: ' + detail + ' Выдача неизвестна. Повтор — только вручную.';
+        return result;
+    }
+    return {describe: describe};
+
+}());
+var Loader = (function (Core, SafeErrors) {
 
     'use strict';
     var schedulers = [];
@@ -348,7 +399,7 @@ var Loader = (function (Core) {
         if (!L.Parser || typeof L.Parser.get !== 'function') fail('Lampa.Parser недоступен в этой сборке.');
         else {
             parserPending = true;
-            timer = setTimer(function () { fail('Parser не завершил запрос за 60 секунд. Выдача неизвестна. Повтор — вручную.'); }, 60000);
+            timer = setTimer(function () { fail(SafeErrors.describe(L, null, 'timeout').message); }, 60000);
             try {
                 L.Parser.get({search: query, from_search: true, other: true}, function (data) {
                     if (stopped || settled) return;
@@ -361,10 +412,10 @@ var Loader = (function (Core) {
                     if (callbacks.preview) callbacks.preview(snapshot);
                     if (stopped) return;
                     metadata = enrich(L, snapshot, callbacks, options);
-                }, function () {
-                    fail('Parser сообщил ошибку. Возможен отказ доступа, включая 403. Выдача неизвестна. Повтор — вручную.');
+                }, function (error, exception) {
+                    fail(SafeErrors.describe(L, error, 'parser', exception).message);
                 });
-            } catch (e) { fail('Не удалось запустить Parser. Выдача неизвестна.'); }
+            } catch (e) { fail('Не удалось запустить Parser. ' + SafeErrors.describe(L, e, 'js').message); }
         }
         return {cancel: function () {
             if (stopped) return;
@@ -378,13 +429,15 @@ var Loader = (function (Core) {
     }
     return {load: load, enrich: enrich};
 
-}(Core));
+}(Core, SafeErrors));
 /* Runtime appended to the single-file v2 bundle by build.js. */
 (function (root) {
     'use strict';
-    if (typeof module !== 'undefined' && module.exports) module.exports = {Core: Core, Loader: Loader, Adapter: Adapter, Helpers: Helpers};
-    if (!root || !root.Lampa || !root.jQuery || root.__lampa_3d_vr_catalog_v2) return;
+    if (typeof module !== 'undefined' && module.exports) module.exports = {Core: Core, Loader: Loader, Adapter: Adapter, Helpers: Helpers, SafeErrors: SafeErrors};
+    if (!root || !root.Lampa || !root.jQuery || root.__lampa_3d_vr_catalog_v021) return;
     var L = root.Lampa, $ = root.jQuery, registered = false, parserOwner = null;
+    var diagnosticMode = Boolean(root.document && root.document.currentScript && /(?:[?&])diag=once(?:&|$)/.test(root.document.currentScript.src || ''));
+    var diagnosticRequestStarted = false;
     var cache = Object.create(null), cacheOrder = [];
     var NAME = 'lampa_3d_vr_catalog';
     var SECTIONS = [
@@ -395,7 +448,7 @@ var Loader = (function (Core) {
         {id: 'vr180', title: 'VR180'},
         {id: 'vr360', title: '360°'}
     ];
-    root.__lampa_3d_vr_catalog_v2 = true;
+    root.__lampa_3d_vr_catalog_v021 = true;
     function saveCache(key, data) {
         cache[key] = data;
         var old = cacheOrder.indexOf(key);
@@ -409,7 +462,7 @@ var Loader = (function (Core) {
         var head = $('<div style="padding:1em"></div>');
         var toolbar = $('<div style="display:flex;flex-wrap:wrap;gap:.5em"></div>');
         var status = $('<div style="padding:.6em 0" role="status"></div>');
-        var notice = $('<div style="font-size:.8em;opacity:.8;padding:.3em 0"></div>').text('Подборка из ответов Parser, не полный каталог. Метки формата предположительны; SBS не доказывает VR.');
+        var notice = $('<div style="font-size:.8em;opacity:.8;padding:.3em 0"></div>').text('v0.2.1 · Подборка из ответов Parser, не полный каталог. Метки формата предположительны; SBS не доказывает VR.' + (diagnosticMode ? ' Диагностика: один Parser-запрос вручную, без запросов TMDB.' : ''));
         var pager = $('<div style="display:flex;gap:.5em;align-items:center"></div>');
         var pageLabel = $('<span></span>');
         var grid = $('<div class="mapping--grid cols--6"></div>');
@@ -457,11 +510,11 @@ var Loader = (function (Core) {
         function controls() {
             buttons.section.text('Раздел: ' + sectionTitle());
             buttons.search.text(query.trim() ? 'Запрос: ' + query.trim() : 'Поиск по названию');
-            buttons.submit.toggleClass('hide', !query.trim());
+            buttons.submit.toggleClass('hide', diagnosticMode || !query.trim());
             buttons.browse.toggleClass('hide', !searching);
             buttons.cancel.toggleClass('hide', !busy);
-            buttons.more.toggleClass('hide', busy || !data || !data.groups.some(function (g) { return g.eligible && !g.metadataChecked; }));
-            buttons.seeds.toggleClass('hide', searching);
+            buttons.more.toggleClass('hide', diagnosticMode || busy || !data || !data.groups.some(function (g) { return g.eligible && !g.metadataChecked; }));
+            buttons.seeds.toggleClass('hide', diagnosticMode || searching);
             var total = Math.max(1, Math.ceil(visibleGroups().length / 20));
             buttons.prev.toggleClass('hide', pageNumber <= 1);
             buttons.next.toggleClass('hide', pageNumber >= total);
@@ -545,13 +598,15 @@ var Loader = (function (Core) {
             if (wasBusy) { cancelled = true; message = text || 'Загрузка отменена. Уже полученные карточки сохранены; поздние ответы игнорируются.'; }
             controls();
         }
-        function begin(queryValue, append) {
+        function begin(queryValue, append, control) {
+            if (diagnosticMode && (!control || diagnosticRequestStarted)) { message = diagnosticRequestStarted ? 'Диагностика: один запрос уже выполнен/запущен. Автоматического повтора нет.' : 'Диагностика v0.2.1: нажмите «Контрольный запрос». До нажатия запросов нет.'; controls(); return; }
             cancel();
             if (!L.Maker || typeof L.Maker.make !== 'function') { failure = 'Эта сборка Lampa не предоставляет Maker для штатных карточек.'; controls(); return; }
             if (parserOwner && parserOwner !== self) { failure = 'Другой экран 3D / VR выполняет запрос. Отмените его на том экране.'; controls(); return; }
             var id = serial, key = cacheKey(), base = append ? data : null;
             if (append && base && base.queries.indexOf(queryValue) >= 0) { message = 'Эта метка уже загружена в подборку.'; failure = ''; controls(); return; }
             if (append && base && base.queries.length >= 4) { message = 'В подборке уже четыре запроса. Для новой выборки нажмите «Обновить».'; controls(); return; }
+            if (diagnosticMode) diagnosticRequestStarted = true;
             busy = true; cancelled = false; failure = '';
             message = 'Поиск релизов через настроенный Parser: ' + queryValue + '…';
             parserOwner = self;
@@ -588,7 +643,7 @@ var Loader = (function (Core) {
                     renderPage(false);
                 }
             };
-            var job = Loader.load(L, format, queryValue, Helpers, callbacks, {ownsParser: true});
+            var job = Loader.load(L, format, queryValue, Helpers, callbacks, {ownsParser: true, maxMetadata: diagnosticMode ? 0 : 20});
             if (id === serial && busy) handle = job;
         }
         function enterSection(id) {
@@ -633,7 +688,7 @@ var Loader = (function (Core) {
             }});
         }
         button('section', 'Разделы', sections);
-        button('refresh', 'Обновить', function () { begin(searching ? activeQuery : defaultQuery(), false); });
+        button('refresh', diagnosticMode ? 'Контрольный запрос' : 'Обновить', function () { begin(searching ? activeQuery : defaultQuery(), false, diagnosticMode); });
         button('seeds', 'Другие метки', seeds);
         button('more', 'Ещё постеры', metadata);
         button('search', 'Поиск по названию', function () {
